@@ -568,22 +568,25 @@ class UltraMemLayerV2(torch.nn.Module):
             score_list = score_list_mat.reshape(self.tucker_multihead, bs, head_num, -1)
             all_scores = score_list.sum(dim=0)
 
+        # Non-NPU (GPU) path selects the top-knn indices with a Triton gather,
+        # avoiding the O(knn^2) Cartesian index grid that OOMs at knn=256
+        # (paper Sec. 4.1).  NPU has no Triton kernel, so it keeps the explicit
+        # all_indices materialisation + gather.
         if not USE_NPU:
-            all_indices = (
-                indices1.view(bs, head_num, self.knn, 1).expand(bs, head_num, self.knn, self.knn) * n_keys +
-                indices2.view(bs, head_num, 1, self.knn).expand(bs, head_num, self.knn, self.knn)
-            ).view(bs, head_num, -1)
+            _, best_topk_idx = torch.topk(all_scores, k=self.knn, dim=2, largest=True, sorted=True)
+            best_scores = torch.stack([s.gather(2, best_topk_idx) for s in score_list], dim=-1).view(bs,-1,self.tucker_multihead)
+            from fuse_ops.fused_index import triton_gather_indices_2d
+            best_indices = triton_gather_indices_2d(
+                indices1.contiguous(), indices2.contiguous(), best_topk_idx.contiguous(), n_keys
+            ).view(bs, -1)
         else:
             all_indices = (
                 indices1.view(bs, head_num, self.knn, 1) * n_keys +
                 indices2.view(bs, head_num, 1, self.knn)
             ).view(bs, head_num, -1)
-
-        
-        scores, best_indices = torch.topk(all_scores, k=self.knn, dim=2, largest=True, sorted=True)
-
-        best_scores = torch.stack([s.gather(2, best_indices) for s in score_list], dim=-1).view(bs,-1,self.tucker_multihead)
-        best_indices = all_indices.gather(2, best_indices).view(bs,-1)
+            scores, best_indices = torch.topk(all_scores, k=self.knn, dim=2, largest=True, sorted=True)
+            best_scores = torch.stack([s.gather(2, best_indices) for s in score_list], dim=-1).view(bs,-1,self.tucker_multihead)
+            best_indices = all_indices.gather(2, best_indices).view(bs,-1)
 
         return best_scores, best_indices, balance_reg_loss_key
 
