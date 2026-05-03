@@ -252,7 +252,9 @@ class UltraMemLayerV1(torch.nn.Module):
                 best_scores = best_scores.permute(2,0,1).contiguous()
             else:
                 best_scores = best_scores.squeeze(dim=-1)
-            output = FusedLookup.apply(best_indice_shuffled.to(torch.int32), self.values_for_look_up, best_scores, 0, self.value_num, self.value_num, 0, self.value_expand_time, False)
+            val_w = self.values_for_look_up
+            val_w_bf16 = val_w if val_w.dtype == torch.bfloat16 else val_w.to(torch.bfloat16)
+            output = FusedLookup.apply(best_indice_shuffled.to(torch.int32), val_w_bf16, val_w.main_grad, best_scores, 0, self.value_num, self.value_num, 0, self.value_expand_time, False)
         else:
             real_indice = best_indice_shuffled % self.value_num
             group_indice = best_indice_shuffled // self.value_num

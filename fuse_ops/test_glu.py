@@ -30,7 +30,9 @@ p_input2.requires_grad = True
 vocab_size = weight1.shape[0]
 per_layer_vocab_size = weight1.shape[0]
 shift = 0
-out1 = XperfGlu.apply(indices, weight1, p_input1, vocab_size, per_layer_vocab_size, shift, group_size, 0, False)
+weight1_bf16 = weight1 if weight1.dtype == torch.bfloat16 else weight1.to(torch.bfloat16)
+main_grad1 = torch.zeros_like(weight1, dtype=torch.float32)
+out1 = XperfGlu.apply(indices, weight1_bf16, main_grad1, p_input1, vocab_size, per_layer_vocab_size, shift, group_size, 0, False)
 # print("out1", out1)
 out_rand_like = torch.rand_like(out1)
 loss1=(out1 * out_rand_like).sum()
@@ -50,7 +52,7 @@ loss2.backward()
 
 diff1=out1-out2
 print("diff1", diff1.max(), diff1.min())
-diff2=weight1.grad-weight2.grad
+diff2=main_grad1.to(weight2.grad.dtype)-weight2.grad
 print("diff2", diff2.max(), diff2.min())
 diff3=p_input1.grad-p_input2.grad
 print("diff3", diff3.max(), diff3.min())

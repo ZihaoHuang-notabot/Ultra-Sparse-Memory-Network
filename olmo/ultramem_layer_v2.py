@@ -648,12 +648,16 @@ class UltraMemLayerV2(torch.nn.Module):
             output_parallel = [p_inputs.view(-1), outputs_buffer, send_receive_count, send_receive_count]
             output = EmbeddingAll2AllSingle.apply(*output_parallel)
             output = output.view(memory_layer_parallel_size * max_entry_num, self.local_pre_vdim)
-            pre_score = XperfGlu.apply(total_indices, self.pre_values_for_look_up, output, all_value_num, value_num, offset, 1, 0, False)
+            pre_w = self.pre_values_for_look_up
+            pre_w_bf16 = pre_w if pre_w.dtype == torch.bfloat16 else pre_w.to(torch.bfloat16)
+            pre_score = XperfGlu.apply(total_indices, pre_w_bf16, pre_w.main_grad, output, all_value_num, value_num, offset, 1, 0, False)
             pre_score = AllReduceInMemGroup().apply(pre_score)
             if self.use_glu_act:
                 pre_score = F.gelu(pre_score)
             all_score = pre_score.squeeze(-1) * all_score
-        emb = FusedLookup.apply(total_indices, self.values_for_look_up, all_score, padding_idx, all_value_num, value_num, offset, self.fake_value_expand_time, has_padding_idx)
+        val_w = self.values_for_look_up
+        val_w_bf16 = val_w if val_w.dtype == torch.bfloat16 else val_w.to(torch.bfloat16)
+        emb = FusedLookup.apply(total_indices, val_w_bf16, val_w.main_grad, all_score, padding_idx, all_value_num, value_num, offset, self.fake_value_expand_time, has_padding_idx)
         entry_counts = [max_entry_num] * memory_layer_parallel_size
         emb_send_recv_count = [x * emb.shape[-1] for x in entry_counts]
         embedding_outputs_buffer = torch.empty(max_entry_num * emb.shape[-1] * memory_layer_parallel_size, dtype=emb.dtype, device=emb.device, requires_grad=False)
@@ -668,7 +672,9 @@ class UltraMemLayerV2(torch.nn.Module):
         if not USE_NPU:  # NPU does not support CUDA kernels
             from fuse_ops.fused_index import XperfGlu, FusedLookup
             if pre_input is not None:
-                pre_score = XperfGlu.apply(best_indice.to(torch.int32), self.pre_values_for_look_up, pre_input, all_value_num, value_num, offset, 1, 0, False)
+                pre_w = self.pre_values_for_look_up
+                pre_w_bf16 = pre_w if pre_w.dtype == torch.bfloat16 else pre_w.to(torch.bfloat16)
+                pre_score = XperfGlu.apply(best_indice.to(torch.int32), pre_w_bf16, pre_w.main_grad, pre_input, all_value_num, value_num, offset, 1, 0, False)
                 if self.use_glu_act:
                     pre_score = F.gelu(pre_score)
                 best_scores = pre_score.unsqueeze(-1) * best_scores
@@ -676,7 +682,9 @@ class UltraMemLayerV2(torch.nn.Module):
                 best_scores = best_scores.permute(2,0,1).contiguous()
             else:
                 best_scores = best_scores.squeeze(dim=-1)
-            output = FusedLookup.apply(best_indice.to(torch.int32), self.values_for_look_up, best_scores, 0, all_value_num, value_num, offset, self.fake_value_expand_time, False)
+            val_w = self.values_for_look_up
+            val_w_bf16 = val_w if val_w.dtype == torch.bfloat16 else val_w.to(torch.bfloat16)
+            output = FusedLookup.apply(best_indice.to(torch.int32), val_w_bf16, val_w.main_grad, best_scores, 0, all_value_num, value_num, offset, self.fake_value_expand_time, False)
         else:
             real_indice = ((best_indice % value_num) + offset) % all_value_num
 

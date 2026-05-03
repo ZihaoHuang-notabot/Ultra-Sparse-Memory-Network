@@ -1059,7 +1059,6 @@ class Trainer:
             for name, p in zip(group["param_names"], group["params"]):
                 if 'values_for_look_up' in name or 'pre_values_for_look_up' in name:
                     p.main_grad.zero_()
-                    p.param_bf16 = p.to(torch.bfloat16)
 
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
