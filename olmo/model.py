@@ -1758,6 +1758,11 @@ class OLMo(nn.Module):
             def fsdp_wrap_fn(module, recurse: bool = True, nonwrapped_numel: int = 0):
                 del nonwrapped_numel
                 wrap = isinstance(module, OLMoBlock) or isinstance(module, UltraMemLayerV1) or isinstance(module, UltraMemLayerV2)
+                # full_memory_layer (has_value=True) is accessed directly by
+                # mem_blocks, not through its own forward(), so FSDP must not
+                # shard it independently.
+                if isinstance(module, (UltraMemLayerV1, UltraMemLayerV2)) and getattr(module, "has_value", False):
+                    wrap = False
                 if recurse:
                     return True
                 else:
