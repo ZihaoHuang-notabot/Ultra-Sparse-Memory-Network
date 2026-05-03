@@ -161,6 +161,8 @@ class UltraMemLayerV2(torch.nn.Module):
         self.tucker_rank_penalty = tucker_rank_penalty
         self.v_proj_in_dim = v_proj_in_dim
         self.hidden_size = hidden_size
+        self.mem_layer_num = mem_layer_num
+        self.kinner = config.mlp_ratio
         self.key_balance_reg_coef = config.mem_key_balance_reg_coef
         self.mem_q_for_each_tucker_rank = config.mem_q_for_each_tucker_rank
         self.use_glu_act = config.mem_use_glu_act
@@ -210,8 +212,17 @@ class UltraMemLayerV2(torch.nn.Module):
 
     def reset_parameters(self, distributed_strategy):
         if self.has_value:
-            # value init
-            std_value1 = 0.02
+            # Paper Eq. 26 (Appendix A.3): set sigma_V so the memory layer's output
+            # variance at init equals that of a single FFN layer.
+            #   sigma_V = (0.2 * k_inner * h
+            #              / (k * n_head * (1+sigma_s^2) * d_prev * d_v * L))^(1/4)
+            # sigma_s^2 = variance of top-1 routing score after norm/temperature
+            # (paper App. A.2), measured empirically below.
+            sigma_s_sq = self._measure_sigma_s_squared()
+            numer = 0.2 * self.kinner * self.hidden_size
+            denom = (self.knn * self.head * (1.0 + sigma_s_sq)
+                     * max(self.pre_vdim, 1) * self.vdim * self.mem_layer_num)
+            std_value1 = (numer / denom) ** 0.25
             if self.vertical_parallel:
                 rank = get_memory_layer_parallel_rank()
                 start = rank * self.local_vdim
@@ -252,7 +263,13 @@ class UltraMemLayerV2(torch.nn.Module):
             nn.init.constant_(self.keys_norm.weight, val=1/self.kdim**0.4)
 
             nn.init.normal_(self.query_proj.weight, mean=0.0, std=1/(math.sqrt(self.kdim)))
-            nn.init.normal_(self.values_proj.weight, mean=0.0, std=1/(math.sqrt(self.v_proj_in_dim)))
+            # values_proj is the residual-stream projection — equivalent to OLMo's
+            # ff_out.  Paper App. A assumes it is 1/sqrt(2L)-scaled so the memory-layer
+            # output variance derived in Eq. 26 actually matches the FFN baseline.
+            # Without this, the memory residual dominates the residual stream by
+            # sqrt(2L) at init and Eq. 26's sigma_V is calibrated against a fictional
+            # baseline.
+            nn.init.normal_(self.values_proj.weight, mean=0.0, std=self._compute_values_proj_std())
 
             nn.init.normal_(self.keys, mean=0.0, std=1/(math.sqrt(self.kdim)))
             if self.pre_vdim > 0 :
@@ -290,7 +307,94 @@ class UltraMemLayerV2(torch.nn.Module):
         result = super().load_state_dict(*args, **kwargs)
         self.post_load_init()
         return result
-    
+
+    def _compute_values_proj_std(self):
+        """Init std for the residual-stream projection (`values_proj`).
+
+        Mirrors olmo/model.py reset_parameters logic for ff_out so the memory
+        residual at init matches the FFN residual.  Falls back to the legacy
+        1/sqrt(v_proj_in_dim) when init_fn is unset.
+        """
+        from olmo.config import InitFnType
+        init_fn = getattr(self.config, "init_fn", None)
+        n_layers = getattr(self.config, "n_layers", None)
+        init_std = getattr(self.config, "init_std", None)
+        if init_fn == InitFnType.full_megatron and n_layers and init_std:
+            return init_std / math.sqrt(2.0 * n_layers)
+        if init_fn == InitFnType.mitchell:
+            return 1.0 / math.sqrt(2 * self.v_proj_in_dim * (self.layer_id + 1))
+        if init_fn == InitFnType.normal and init_std:
+            return init_std
+        return 1.0 / math.sqrt(self.v_proj_in_dim)
+
+    @torch.no_grad()
+    def _measure_sigma_s_squared(self, n_samples: int = 2048) -> float:
+        """Empirical sigma_s^2 (paper App. A.2): variance of top-1 routing score
+        after norm/temperature, given current architectural choices.  Used by
+        Eq. 26.
+
+        Builds synthetic queries/keys matching the intended init distributions
+        (no FSDP, no GPU required).  Run once at init on the value-owning layer.
+        """
+        kdim = self.kdim
+        head = self.head
+        tucker_rank = self.tucker_rank
+        knn = min(self.knn, self.key_num)
+        # Match the actual norm-init formula used in reset_parameters above.
+        norm_init = 1.0 / kdim ** 0.4
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        # Post-layernorm input has unit variance.
+        x = torch.randn(n_samples, self.hidden_size, device=device, dtype=dtype)
+        qtr = tucker_rank if self.mem_q_for_each_tucker_rank else 1
+        q_w = torch.randn(self.hidden_size, kdim * 2 * qtr, device=device, dtype=dtype) / math.sqrt(kdim)
+        q = (x @ q_w).view(n_samples, 2, qtr, kdim)
+        # query_norm ~ layernorm with constant scale norm_init.
+        q = (q - q.mean(-1, keepdim=True)) / q.std(-1, unbiased=False, keepdim=True).clamp_min(1e-6) * norm_init
+
+        keys = torch.randn(head, 2, self.key_num, kdim, tucker_rank, device=device, dtype=dtype) / math.sqrt(kdim)
+        keys = (keys - keys.mean(-2, keepdim=True)) / keys.std(-2, unbiased=False, keepdim=True).clamp_min(1e-6) * norm_init
+
+        half = kdim // 2
+        s1_per_rank = []
+        s2_per_rank = []
+        for r in range(tucker_rank):
+            if self.mem_q_for_each_tucker_rank:
+                q1r = q[:, 0, r, :half]
+                q2r = q[:, 1, r, half:]
+            else:
+                q1r = q[:, 0, 0, :half]
+                q2r = q[:, 1, 0, half:]
+            s1_h = []
+            s2_h = []
+            for h_idx in range(head):
+                k1 = keys[h_idx, 0, :, :half, r]   # [key_num, half]
+                k2 = keys[h_idx, 1, :, half:, r]
+                s1_h.append(q1r @ k1.T)
+                s2_h.append(q2r @ k2.T)
+            s1_per_rank.append(torch.stack(s1_h, dim=1))  # [n, head, key_num]
+            s2_per_rank.append(torch.stack(s2_h, dim=1))
+        s1 = torch.stack(s1_per_rank, dim=-1)  # [n, head, key_num, tucker_rank]
+        s2 = torch.stack(s2_per_rank, dim=-1)
+
+        # tucker_core_uv is zero at init; the dominant-eigenvector projection
+        # collapses to picking rank-0.  Approximate by summing across ranks.
+        s1p = s1.sum(-1)  # [n, head, key_num]
+        s2p = s2.sum(-1)
+
+        s1_top, _ = s1p.topk(knn, dim=-1)
+        s2_top, _ = s2p.topk(knn, dim=-1)
+
+        # Bilinear via mean tucker_core entry (U(0,1) -> mean 0.5).
+        bilinear = (s1_top.unsqueeze(-1) * s2_top.unsqueeze(-2) * 0.5).reshape(n_samples, head, -1)
+        top_scores, _ = bilinear.topk(min(knn, bilinear.size(-1)), dim=-1)
+        # Normalize so mean top-1 ~ 1 (paper A.2 calibration target), then take var.
+        top1 = top_scores[..., 0]
+        mean = top1.mean().clamp_min(1e-6)
+        return float((top1 / mean).var().item())
+
     def _calc_tucker_1rank(self):
         tucker_core_sum = torch.stack(list(self.tucker_core), dim=0).sum(dim=0).to(torch.float32)
 
