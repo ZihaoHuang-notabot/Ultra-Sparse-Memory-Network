@@ -1034,10 +1034,14 @@ class Trainer:
             for hook in output_hooks:
                 hook.remove()
 
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                param.grad /= get_world_size()
-                dist.all_reduce(param.grad.data)
+        # Under FSDP, gradient reduce-scatter already happens during backward,
+        # so manual all-reduce would corrupt shards and can desync ranks.
+        # Only needed for DDP where no_sync() disables built-in gradient sync.
+        if self.cfg.distributed_strategy != DistributedStrategy.fsdp:
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    param.grad /= get_world_size()
+                    dist.all_reduce(param.grad.data)
         return ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
