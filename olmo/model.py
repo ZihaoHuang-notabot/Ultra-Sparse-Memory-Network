@@ -1424,7 +1424,7 @@ class OLMo(nn.Module):
         else:
             return device
 
-    def reset_parameters(self, distributed_strategy):
+    def reset_parameters(self, distributed_strategy, skip_mem_layers: bool = False):
         log.info("Initializing model parameters...")
         # Top-level embeddings / linear layers.
 
@@ -1491,10 +1491,11 @@ class OLMo(nn.Module):
             for block_group in self.transformer.block_groups:
                 block_group.reset_parameters()
         
-        for mem_layer in self.transformer.mem_blocks:
-            mem_layer.reset_parameters(distributed_strategy)
-        if (self.config.mem_type == 'ultramem_v2' or self.config.mem_type =='memory_plus') and hasattr(self.transformer, "full_memory_layer"):
-            self.transformer.full_memory_layer.reset_parameters(distributed_strategy)
+        if not skip_mem_layers:
+            for mem_layer in self.transformer.mem_blocks:
+                mem_layer.reset_parameters(distributed_strategy)
+            if (self.config.mem_type == 'ultramem_v2' or self.config.mem_type =='memory_plus') and hasattr(self.transformer, "full_memory_layer"):
+                self.transformer.full_memory_layer.reset_parameters(distributed_strategy)
 
     def get_alibi_attention_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
         if (alibi_bias := self.__cache.get("alibi_attention_bias")) is not None and alibi_bias.shape[
@@ -1671,7 +1672,14 @@ class OLMo(nn.Module):
                     )
                 if self.mem_insert_way == 'full':
                     if self.config.mem_type == 'ultramem_v2'or self.config.mem_type == 'memory_plus':
-                        mem_out = self.transformer.mem_blocks[block_idx](block.ffn_input_after_norm, self.transformer.full_memory_layer)
+                        if should_checkpoint_block(self.activation_checkpointing_strategy, block_idx):
+                            mem_out = self._activation_checkpoint_fn(
+                                self.transformer.mem_blocks[block_idx],
+                                block.ffn_input_after_norm,
+                                self.transformer.full_memory_layer,
+                            )
+                        else:
+                            mem_out = self.transformer.mem_blocks[block_idx](block.ffn_input_after_norm, self.transformer.full_memory_layer)
                     else:
                         mem_out = self.transformer.mem_blocks[block_idx](block.ffn_input_after_norm)
                     x = x + mem_out
@@ -1679,7 +1687,14 @@ class OLMo(nn.Module):
                     if block_idx in self.mem_insert_way:
                         mem_out_idx, mem_layer_idx = self.mem_insert_way[block_idx]
                         if self.config.mem_type == 'ultramem_v2' or self.config.mem_type == 'memory_plus':
-                            mem_out = self.transformer.mem_blocks[mem_layer_idx](block.ffn_input_after_norm, self.transformer.full_memory_layer)
+                            if should_checkpoint_block(self.activation_checkpointing_strategy, block_idx):
+                                mem_out = self._activation_checkpoint_fn(
+                                    self.transformer.mem_blocks[mem_layer_idx],
+                                    block.ffn_input_after_norm,
+                                    self.transformer.full_memory_layer,
+                                )
+                            else:
+                                mem_out = self.transformer.mem_blocks[mem_layer_idx](block.ffn_input_after_norm, self.transformer.full_memory_layer)
                         else:
                             mem_out = self.transformer.mem_blocks[mem_layer_idx](block.ffn_input_after_norm)
                     if mem_out_idx == block_idx:
