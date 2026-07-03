@@ -1,4 +1,15 @@
-import torch
+import torch 
+import os
+USE_NPU = os.environ.get("USE_NPU") == "True"
+try:
+    import torch_npu
+    USE_NPU = torch.npu.is_available()
+except ImportError:
+    pass
+
+from functools import partial
+import einops
+
 from torch import nn
 import numpy as np
 from .model import LayerNormBase
@@ -266,6 +277,19 @@ class UltraMemLayerV2(torch.nn.Module):
             self.score_top1_mean = None
             self.score_topn_mean = None
 
+    def post_load_init(self):
+        if USE_NPU:
+            if not self.has_value:        
+                self.tucker_core_uv = torch.nn.Parameter(torch.stack([self.tucker_core_u.flatten(), self.tucker_core_v.flatten()], dim=-1).contiguous())
+                self.tucker_core_stacked = torch.nn.Parameter(torch.stack(tuple(self.tucker_core), dim=0).contiguous())
+            else:
+                self.pre_values_for_look_up.data = self.pre_values_for_look_up.data.to(torch.bfloat16)
+                self.values_for_look_up.data = self.values_for_look_up.data.to(torch.bfloat16)
+        
+    def load_state_dict(self, *args, **kwargs):
+        result = super().load_state_dict(*args, **kwargs)
+        self.post_load_init()
+        return result
     
     def _calc_tucker_1rank(self):
         tucker_core_sum = torch.stack(list(self.tucker_core), dim=0).sum(dim=0).to(torch.float32)
@@ -305,14 +329,18 @@ class UltraMemLayerV2(torch.nn.Module):
         qtr = self.tucker_rank if self.mem_q_for_each_tucker_rank else 1
         query = query.view(bs, 2, qtr, self.kdim)             # output shape: [bs, 2, kdim]
         query = self.query_norm(query)
-        query = query.view(bs, 2, qtr*self.kdim)
+        if not USE_NPU:
+            query = query.view(bs, 2, qtr*self.kdim)
 
         keys = self.keys_norm(self.keys.transpose(3,4)).transpose(3,4)
 
         best_scores, best_indice, balance_reg_loss_key = self.TuckerDecomposedQueryKeyRetrieval(query, keys)
 
         # get real index
-        best_indice = self.shuffle_index[best_indice]
+        if not USE_NPU:
+            best_indice = self.shuffle_index[best_indice]
+        else:
+            best_indice = torch.nn.functional.embedding(best_indice, self.shuffle_index.unsqueeze(1)).squeeze(-1)
         #group_indice = best_indice // self.value_num
         #real_indice = ((best_indice % self.value_num) + self.offset) % self.all_value_num
 
@@ -355,23 +383,44 @@ class UltraMemLayerV2(torch.nn.Module):
 
     def TuckerDecomposedQueryKeyRetrieval(self, query, keys):
         bs = query.shape[0]
+        if USE_NPU:
+            qtr = query.shape[-2]
         head_num, _, n_keys, kdim, tucker_rank = keys.shape
         nhead_share_query = 2
 
         # generate score
-        scores1_refine = []
-        scores2_refine = []
-        for key_idx in range(tucker_rank):
-            scores1_refine_, scores2_refine_ = ParallelKeyQueryInnerProduct.apply(
-                query, torch.select(keys,-1,key_idx), bs, n_keys, head_num, nhead_share_query
+        if not USE_NPU:
+            scores1_refine = []
+            scores2_refine = []
+            for key_idx in range(tucker_rank):
+                scores1_refine_, scores2_refine_ = ParallelKeyQueryInnerProduct.apply(
+                    query, torch.select(keys,-1,key_idx), bs, n_keys, head_num, nhead_share_query
+                )
+                scores1_refine.append(scores1_refine_)
+                scores2_refine.append(scores2_refine_)
+            scores1_refine = torch.stack(scores1_refine, dim=-1)
+            scores2_refine = torch.stack(scores2_refine, dim=-1)
+        else:
+            assert nhead_share_query <= 2, "This optimization has only been implemented for nhead_share_query <= 2.  Otherwise, you need to replace every chunk (chunk.size=nhead_share_query) of nhead_share_query heads with the first head in that chunk to maintain correctness"
+            # Note: Due to different contraction order in the einsum than the original, there is a slight error in scores_refine.  This may be eliminated by casting query and keys to float16 (not bfloat16!) first for the extra required mantissa bits
+            scores_refine = einops.einsum(
+                query.reshape(bs, 2, qtr, self.kdim)[:,:,0,:].unsqueeze(2),
+                keys, 
+                "bs tensor_rank heads kdim, heads tensor_rank n_keys kdim tucker_rank -> bs heads n_keys tucker_rank tensor_rank"
             )
-            scores1_refine.append(scores1_refine_)
-            scores2_refine.append(scores2_refine_)
-        scores1_refine = torch.stack(scores1_refine, dim=-1)
-        scores2_refine = torch.stack(scores2_refine, dim=-1)
+            scores1_refine, scores2_refine = map(partial(torch.squeeze, dim=-1), scores_refine.split(1, dim=-1))
 
-        scores1 = (scores1_refine * self.tucker_core_u).sum(-1)#.detach()
-        scores2 = (scores2_refine * self.tucker_core_v).sum(-1)#.detach()
+        if not USE_NPU:
+            scores1 = (scores1_refine * self.tucker_core_u).sum(-1)#.detach()
+            scores2 = (scores2_refine * self.tucker_core_v).sum(-1)#.detach()
+        else:
+            scores = einops.einsum(
+                query.view(bs, 2, qtr, self.kdim)[:,:,0,:].unsqueeze(2),
+                keys, 
+                self.tucker_core_uv,
+                "bs tensor_rank heads kdim, heads tensor_rank n_keys kdim tucker_rank, tucker_rank tensor_rank -> tensor_rank bs heads n_keys"
+            )
+            scores1, scores2 = map(partial(torch.squeeze, dim=0), scores.split(1, dim=0))
 
         scores1_chosen, indices1 = scores1.topk(self.knn, dim=2, largest=True, sorted=True)
         scores2_chosen, indices2 = scores2.topk(self.knn, dim=2, largest=True, sorted=True)
@@ -400,15 +449,33 @@ class UltraMemLayerV2(torch.nn.Module):
         _scores1_refine = scores1_refine.gather(2, indices1.unsqueeze(dim=-1).expand(-1,-1,-1,scores1_refine.shape[-1]))
         _scores2_refine = scores2_refine.gather(2, indices2.unsqueeze(dim=-1).expand(-1,-1,-1,scores2_refine.shape[-1])) # [bs, head_num, topk, tucker_rank]
 
-        score_list = []
-        for i in range(self.tucker_multihead):
-            score_list.append((_scores1_refine @ (self.tucker_core[i]) @ _scores2_refine.transpose(-1,-2)).view(bs, head_num, -1))
-        all_scores = torch.stack(score_list, dim=-1).sum(dim=-1)
+        if not USE_NPU:
+            score_list = []
+            for i in range(self.tucker_multihead):
+                score_list.append((_scores1_refine @ (self.tucker_core[i]) @ _scores2_refine.transpose(-1,-2)).view(bs, head_num, -1))
+            all_scores = torch.stack(score_list, dim=-1).sum(dim=-1)
+        else:
+            score_list_mat = einops.einsum(
+                _scores1_refine, 
+                self.tucker_core_stacked,
+                _scores2_refine, 
+                "bs head n_keys1 tucker_rank1, core_head head tucker_rank1 tucker_rank2, bs head n_keys2 tucker_rank2 -> core_head bs head n_keys1 n_keys2"
+            )
+            score_list = score_list_mat.reshape(self.tucker_multihead, bs, head_num, -1)
+            all_scores = score_list.sum(dim=0)
 
-        all_indices = (
-            indices1.view(bs, head_num, self.knn, 1).expand(bs, head_num, self.knn, self.knn) * n_keys +
-            indices2.view(bs, head_num, 1, self.knn).expand(bs, head_num, self.knn, self.knn)
-        ).view(bs, head_num, -1)
+        if not USE_NPU:
+            all_indices = (
+                indices1.view(bs, head_num, self.knn, 1).expand(bs, head_num, self.knn, self.knn) * n_keys +
+                indices2.view(bs, head_num, 1, self.knn).expand(bs, head_num, self.knn, self.knn)
+            ).view(bs, head_num, -1)
+        else:
+            all_indices = (
+                indices1.view(bs, head_num, self.knn, 1) * n_keys +
+                indices2.view(bs, head_num, 1, self.knn)
+            ).view(bs, head_num, -1)
+
+        
         scores, best_indices = torch.topk(all_scores, k=self.knn, dim=2, largest=True, sorted=True)
 
         best_scores = torch.stack([s.gather(2, best_indices) for s in score_list], dim=-1).view(bs,-1,self.tucker_multihead)
@@ -417,7 +484,13 @@ class UltraMemLayerV2(torch.nn.Module):
         return best_scores, best_indices, balance_reg_loss_key
 
     def ImplicitValueExpansionParallel(self, best_scores, best_indice, pre_input, all_value_num, value_num, offset):
-        from fuse_ops.fused_index import XperfGlu, FusedLookup
+        if not USE_NPU:  
+            from fuse_ops.fused_index import XperfGlu, FusedLookup
+        else:  # NPU does not support CUDA kernels
+            from .pytorch_kernels import pytorch_xperf_glu as XperfGlu, pytorch_fused_lookup as FusedLookup
+            XperfGlu.apply = XperfGlu
+            FusedLookup.apply = FusedLookup
+
         from .memory_parallel import gather_from_memory_layer_parallel_region, AllReduceInMemGroup, tucker_multihead_gather_score, get_memory_layer_parallel_world_size, EmbeddingAll2AllSingle, get_memory_layer_parallel_group
         best_indice = best_indice.to(torch.int32)
         entry_num = best_indice.shape[0]
@@ -435,7 +508,12 @@ class UltraMemLayerV2(torch.nn.Module):
         max_entry_num = max_token_num // token_per_entry
         best_indice = best_indice.view(-1)
         if best_indice.numel() < max_token_num:
-            best_indice = F.pad(best_indice, (0, max_token_num - best_indice.numel()), value=padding_idx)
+            if not USE_NPU:
+                best_indice = F.pad(best_indice, (0, max_token_num - best_indice.numel()), value=padding_idx)
+            else:
+                pad_size = max_token_num - best_indice.numel()
+                random_padding = torch.randint(0, max_token_num, (pad_size,), dtype=best_indice.dtype, device=best_indice.device)
+                best_indice = torch.cat([best_indice, random_padding])
         else:
             best_indice = best_indice
 
@@ -483,7 +561,7 @@ class UltraMemLayerV2(torch.nn.Module):
         return concated_output[0:entry_num]
 
     def ImplicitValueExpansion(self, best_scores, best_indice, pre_input, all_value_num, value_num, offset):
-        if True:
+        if not USE_NPU:  # NPU does not support CUDA kernels
             from fuse_ops.fused_index import XperfGlu, FusedLookup
             if pre_input is not None:
                 pre_score = XperfGlu.apply(best_indice.to(torch.int32), self.pre_values_for_look_up, pre_input, all_value_num, value_num, offset, 1, 0, False)
@@ -496,7 +574,6 @@ class UltraMemLayerV2(torch.nn.Module):
                 best_scores = best_scores.squeeze(dim=-1)
             output = FusedLookup.apply(best_indice.to(torch.int32), self.values_for_look_up, best_scores, 0, all_value_num, value_num, offset, self.fake_value_expand_time, False)
         else:
-            group_indice = best_indice // value_num
             real_indice = ((best_indice % value_num) + offset) % all_value_num
 
             bs = best_scores.shape[0]
@@ -506,7 +583,7 @@ class UltraMemLayerV2(torch.nn.Module):
             if pre_input is not None:
                 pre_values = torch.nn.functional.embedding(real_indice, self.pre_values_for_look_up)   # output shape: [bs, knn, pre_vdim]
                 pre_scores = torch.einsum('bd,bkd->bk',(pre_input, pre_values))
-                values = (values * best_scores.unsqueeze(dim=-1) * pre_scores[...,None,None]).view(bs, self.knn*self.head, -1)
+                values = (values * (best_scores.unsqueeze(dim=-1) * pre_scores[...,None,None])).view(bs, self.knn*self.head, -1)
             else:
                 values = (values * best_scores.unsqueeze(dim=-1)).view(bs, self.knn*self.head, -1)
 

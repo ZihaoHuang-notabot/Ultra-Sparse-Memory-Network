@@ -9,6 +9,14 @@ from abc import abstractmethod
 from inspect import signature
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, cast
 
+import os
+USE_NPU = os.environ.get("USE_NPU") == "True"
+try:
+    import torch_npu
+    USE_NPU = torch.npu.is_available()
+except ImportError:
+    pass
+
 import torch
 
 __all__ = [
@@ -1067,12 +1075,15 @@ class BeamSearch:
                 continue
             _, *last_dims = state_tensor.size()
             # shape: (batch_size, beam_size, *)
-            expanded_backpointer = backpointer.view(batch_size, self.beam_size, *([1] * len(last_dims))).expand(
-                batch_size, self.beam_size, *last_dims
-            )
-            # shape: (batch_size * beam_size, *)
-            state[key] = (
-                state_tensor.reshape(batch_size, self.beam_size, *last_dims)
-                .gather(1, expanded_backpointer)
-                .reshape(batch_size * self.beam_size, *last_dims)
-            )
+            if USE_NPU:
+                state[key] = state_tensor.index_select(0, (backpointer + backpointer.shape[1]*torch.arange(backpointer.shape[0], device=backpointer.device).unsqueeze(1)).flatten())
+            else:
+                expanded_backpointer = backpointer.view(batch_size, self.beam_size, *([1] * len(last_dims))).expand(
+                    batch_size, self.beam_size, *last_dims
+                )
+                # shape: (batch_size * beam_size, *)
+                state[key] = (
+                    state_tensor.reshape(batch_size, self.beam_size, *last_dims)
+                    .gather(1, expanded_backpointer)
+                    .reshape(batch_size * self.beam_size, *last_dims)
+                )

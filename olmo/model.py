@@ -2011,6 +2011,18 @@ class OLMo(nn.Module):
             scores=scores,  # type: ignore[arg-type]
         )
 
+    def trigger_post_load_inits(self):
+        def fn(m: nn.Module):
+            # Only call on modules that actually define this method
+            if hasattr(m, "post_load_init") and callable(m.post_load_init):
+                m.post_load_init()
+        self.apply(fn)
+
+    def load_state_dict(self, *args, **kwargs):
+        result = super().load_state_dict(*args, **kwargs)
+        self.trigger_post_load_inits()
+        return result
+
     @classmethod
     def from_checkpoint(
         cls, checkpoint_dir: PathOrStr, device: str = "cpu", checkpoint_type: Optional[CheckpointType] = None
@@ -2160,3 +2172,4 @@ class OLMo(nn.Module):
             og_keys_to_new[og_key].add(new_key)
 
         return state_dict, og_keys_to_new
+
