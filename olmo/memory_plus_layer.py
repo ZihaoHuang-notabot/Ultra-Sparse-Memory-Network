@@ -165,7 +165,9 @@ class MemoryLayerPlus(torch.nn.Module):
         if True:
             from fuse_ops.fused_index import FusedLookup
             best_scores = best_scores.squeeze(dim=-1)
-            output = FusedLookup.apply(best_indice.to(torch.int32), full_memory_layer.values_for_look_up, best_scores, 0, self.value_num, self.value_num, 0, 1, False)
+            val_w = full_memory_layer.values_for_look_up
+            val_w_bf16 = val_w if val_w.dtype == torch.bfloat16 else val_w.to(torch.bfloat16)
+            output = FusedLookup.apply(best_indice.to(torch.int32), val_w_bf16, val_w.main_grad, best_scores, 0, self.value_num, self.value_num, 0, 1, False)
         else:
             real_indice = best_indice_shuffled % self.value_num
             group_indice = best_indice_shuffled // self.value_num

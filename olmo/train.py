@@ -1034,10 +1034,14 @@ class Trainer:
             for hook in output_hooks:
                 hook.remove()
 
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                param.grad /= get_world_size()
-                dist.all_reduce(param.grad.data)
+        # Under FSDP, gradient reduce-scatter already happens during backward,
+        # so manual all-reduce would corrupt shards and can desync ranks.
+        # Only needed for DDP where no_sync() disables built-in gradient sync.
+        if self.cfg.distributed_strategy != DistributedStrategy.fsdp:
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    param.grad /= get_world_size()
+                    dist.all_reduce(param.grad.data)
         return ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
@@ -1059,7 +1063,6 @@ class Trainer:
             for name, p in zip(group["param_names"], group["params"]):
                 if 'values_for_look_up' in name or 'pre_values_for_look_up' in name:
                     p.main_grad.zero_()
-                    p.param_bf16 = p.to(torch.bfloat16)
 
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)

@@ -150,10 +150,6 @@ def main(cfg: TrainConfig) -> None:
 
     olmo_model.set_activation_checkpointing(cfg.activation_checkpointing)
 
-    for name, param in olmo_model.named_parameters():
-        if param.requires_grad and ('values_for_look_up' in name or 'pre_values_for_look_up' in name):
-            param.main_grad = torch.zeros_like(param, device="cuda", dtype=torch.float32)
-
     if cfg.distributed_strategy == DistributedStrategy.ddp:
         log.info("Wrapping model with DDP...")
         assert cfg.ddp is not None, "DistributedStrategy ddp needs cfg.ddp to be set!"
@@ -211,6 +207,13 @@ def main(cfg: TrainConfig) -> None:
             hybrid_sharding_fsdp_kwargs["device_mesh"] = device_mesh
         # import ipdb; ipdb.set_trace()
 
+        # full_memory_layer is accessed directly by mem_blocks (not through
+        # FSDP's forward), so its params must not be sharded by FSDP.
+        ignored = []
+        if hasattr(olmo_model.transformer, "full_memory_layer"):
+            ignored = list(olmo_model.transformer.full_memory_layer.parameters()) + \
+                      list(olmo_model.transformer.full_memory_layer.buffers())
+
         dist_model = FSDP(
             olmo_model,
             sharding_strategy=cfg.fsdp.sharding_strategy,
@@ -220,7 +223,7 @@ def main(cfg: TrainConfig) -> None:
             limit_all_gathers=True,
             device_id=get_local_rank(),
             param_init_fn=param_init_fn,
-            ignored_states=[],
+            ignored_states=ignored,
             **hybrid_sharding_fsdp_kwargs,
         )
         # import ipdb; ipdb.set_trace()
@@ -229,7 +232,28 @@ def main(cfg: TrainConfig) -> None:
 
     # when param_init_fn is None, FSDP will call reset_parameters() automatically
     if param_init_fn is not None or cfg.distributed_strategy == DistributedStrategy.ddp:
-        olmo_model.reset_parameters(cfg.distributed_strategy)
+        if cfg.distributed_strategy == DistributedStrategy.fsdp:
+            # FSDP flattens and shards parameters, so we need to temporarily
+            # unshard them to initialize with the correct shapes.
+            # Mem layers contain collectives that conflict with FSDP's summon
+            # context — init transformer blocks inside summon, then mem layers outside.
+            with FSDP.summon_full_params(dist_model, writeback=True):
+                olmo_model.reset_parameters(cfg.distributed_strategy, skip_mem_layers=True)
+            for mem_layer in olmo_model.transformer.mem_blocks:
+                mem_layer.reset_parameters(cfg.distributed_strategy)
+            if hasattr(olmo_model.transformer, "full_memory_layer"):
+                olmo_model.transformer.full_memory_layer.reset_parameters(cfg.distributed_strategy)
+        else:
+            olmo_model.reset_parameters(cfg.distributed_strategy)
+
+    # Allocate main_grad for value params after wrapping so that it uses the
+    # (potentially sharded) parameter shapes and doesn't bloat GPU memory
+    # before FSDP has a chance to shard.
+    # Release fragmented memory from FSDP wrapping/init before allocating.
+    torch.cuda.empty_cache()
+    for name, param in dist_model.named_parameters():
+        if param.requires_grad and ('values_for_look_up' in name or 'pre_values_for_look_up' in name):
+            param.main_grad = torch.zeros_like(param, device="cuda", dtype=torch.float32)
 
     log.info(f"Peak GPU Memory (MB) after {cfg.distributed_strategy}: {int(peak_gpu_memory() or 0)}")
     log.info("Model:")

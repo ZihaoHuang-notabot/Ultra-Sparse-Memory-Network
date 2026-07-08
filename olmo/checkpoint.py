@@ -96,6 +96,57 @@ log = logging.getLogger(__name__)
 MODEL_AND_OPTIM_FOLDER = "model_and_optim"
 
 
+def _partition_state_dict(
+    state_dict: Dict[str, Any], ignored_key: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split state dict into FSDP-managed and ignored (vertical-parallel) parts by key substring."""
+    managed: Dict[str, Any] = {}
+    ignored: Dict[str, Any] = {}
+    for k, v in state_dict.items():
+        if ignored_key in k:
+            ignored[k] = v
+        else:
+            managed[k] = v
+    return managed, ignored
+
+
+def _extract_ignored_optim_state(optim, ignored_key: str) -> Dict[str, Any]:
+    """Extract optimizer state for ignored params directly from the optimizer.
+
+    This bypasses FSDP's optim_state_dict machinery, which only handles
+    FSDP-managed params correctly.  Each rank extracts its own local state
+    for the ignored (vertical-parallel) params.
+    """
+    result: Dict[str, Any] = {}
+    for group in optim.param_groups:
+        for name, param in zip(group["param_names"], group["params"]):
+            if ignored_key in name and param in optim.state:
+                result[name] = {
+                    k: v.cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in optim.state[param].items()
+                }
+    return result
+
+
+def _restore_ignored_optim_state(optim, saved_state: Dict[str, Any], ignored_key: str) -> None:
+    """Restore optimizer state for ignored (vertical-parallel) params."""
+    for group in optim.param_groups:
+        for name, param in zip(group["param_names"], group["params"]):
+            if ignored_key in name and name in saved_state:
+                optim.state[param] = {
+                    k: v.to(param.device) if isinstance(v, torch.Tensor) else v
+                    for k, v in saved_state[name].items()
+                }
+
+
+def _set_param_by_name(module: nn.Module, dotted_name: str, value: torch.Tensor) -> None:
+    """Set a parameter's data by its dotted name path (e.g. 'transformer.full_memory_layer.values_for_look_up')."""
+    parts = dotted_name.split(".")
+    for part in parts[:-1]:
+        module = getattr(module, part)
+    getattr(module, parts[-1]).data.copy_(value)
+
+
 def save_fsdp_model_and_optim_state(
     checkpoint_dir: PathOrStr,
     fsdp_model: FSDP,
@@ -637,6 +688,7 @@ class FullCheckpointer(Checkpointer):
     ) -> None:
         with self._temporary_wd(dir) as checkpoint_dir:
             if isinstance(dist_model, FSDP):
+                vertical_parallel = self.cfg.model.vertical_parallel
                 with FSDP.state_dict_type(
                     dist_model,
                     state_dict_type=StateDictType.FULL_STATE_DICT,
@@ -646,14 +698,35 @@ class FullCheckpointer(Checkpointer):
                     # We'll write the model and optimizer state dicts individually to reduce (CPU) memory consumption.
                     # First the model state.
                     model_state_dict = dist_model.state_dict()
-                    self._write_model_dict(
-                        model_state_dict, checkpoint_dir, upload_to, save_overwrite=self.cfg.save_overwrite
-                    )
+                    if vertical_parallel:
+                        # Vertical-parallel value tables are excluded from FSDP (ignored_states),
+                        # so each rank only has its local slice. Save FSDP-managed params on rank 0
+                        # (full), and ignored params per-rank to rank_{N}/model.pt.
+                        managed, ignored = _partition_state_dict(model_state_dict, "full_memory_layer")
+                        self._write_model_dict(
+                            managed, checkpoint_dir, upload_to, save_overwrite=self.cfg.save_overwrite
+                        )
+                        self._write_model_dict_mp(
+                            ignored, checkpoint_dir, upload_to, save_overwrite=self.cfg.save_overwrite
+                        )
+                    else:
+                        self._write_model_dict(
+                            model_state_dict, checkpoint_dir, upload_to, save_overwrite=self.cfg.save_overwrite
+                        )
 
                     # Then the optimizer state.
                     optim_state_dict = FSDP.optim_state_dict(dist_model, optim)
                     self._write_optim_dict(
                         optim_state_dict, checkpoint_dir, upload_to, save_overwrite=self.cfg.save_overwrite
+                    )
+
+                if vertical_parallel:
+                    # Save optimizer state for ignored (vertical-parallel) params per-rank.
+                    # Done outside the FSDP state_dict_type context since these params are
+                    # not managed by FSDP — we extract directly from the optimizer.
+                    ignored_optim = _extract_ignored_optim_state(optim, "full_memory_layer")
+                    self._write_optim_dict_mp(
+                        ignored_optim, checkpoint_dir, upload_to, save_overwrite=self.cfg.save_overwrite
                     )
             elif isinstance(dist_model, DDP):
                 vertical_parallel = self.cfg.model.vertical_parallel
@@ -778,6 +851,43 @@ class FullCheckpointer(Checkpointer):
                             torch.cuda.empty_cache()
                         barrier()
                     del optim_state_dict_to_load
+
+            # Restore ignored (vertical-parallel) params from per-rank checkpoint.
+            # These are saved separately because FSDP's FULL_STATE_DICT only gathers
+            # FSDP-managed params; ignored params need per-rank save/load.
+            vertical_parallel = self.cfg.model.vertical_parallel
+            if vertical_parallel:
+                vp_state = load_state_dict(
+                    load_path / Path(f"rank_{get_global_rank()}"),
+                    "model.pt",
+                    local_cache=local_cache,
+                    map_location="cpu",
+                )
+                unwrapped = dist_model._fsdp_wrapped_module
+                with torch.no_grad():
+                    for key, value in vp_state.items():
+                        _set_param_by_name(unwrapped, key, value)
+                del vp_state
+
+                # Verify no NaNs in restored ignored params.
+                if hasattr(unwrapped.transformer, "full_memory_layer"):
+                    for name, param in unwrapped.transformer.full_memory_layer.named_parameters():
+                        if torch.isnan(param).any():
+                            raise ValueError(
+                                f"full_memory_layer.{name} contains NaNs after restore, "
+                                "vertical-parallel checkpoint may be incomplete"
+                            )
+
+                if load_optimizer_state:
+                    vp_optim = load_state_dict(
+                        load_path / Path(f"rank_{get_global_rank()}"),
+                        "optim.pt",
+                        local_cache=local_cache,
+                        map_location="cpu",
+                    )
+                    _restore_ignored_optim_state(optim, vp_optim, "full_memory_layer")
+                    del vp_optim
+
         elif isinstance(dist_model, DDP):
             # Load model state.
             vertical_parallel = self.cfg.model.vertical_parallel

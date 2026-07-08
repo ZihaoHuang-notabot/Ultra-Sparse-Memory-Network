@@ -302,50 +302,41 @@ class FusedEinsumTopk(torch.autograd.Function):
 
 class FusedLookup(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, indices, weight, scores, padding_idx, vocab_size, per_layer_vocab_size, shift, group_size=1, has_padding_idx=True):
+    def forward(ctx, indices, weight_bf16, main_grad, scores, padding_idx, vocab_size, per_layer_vocab_size, shift, group_size=1, has_padding_idx=True):
+        # weight_bf16: bf16 view of the value table (cast at call site; same tensor if already bf16)
+        # main_grad:   fp32 gradient accumulation buffer owned by the optimizer
         ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift = vocab_size, per_layer_vocab_size, shift
         ctx.padding_idx = padding_idx
         ctx.has_padding_idx = has_padding_idx
         if group_size == 0:
             group_size = 1
         ctx.group_size = group_size
-        if weight.dtype == torch.float32:
-            new_weight = weight.param_bf16
-        else:
-            new_weight = weight
-        ctx.save_for_backward(indices, weight, scores)
+        ctx.save_for_backward(indices, weight_bf16, main_grad, scores)
         import fused_lookup
-        output = fused_lookup.forward(indices.contiguous(), new_weight.contiguous(), scores.contiguous(), vocab_size, per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx)
+        output = fused_lookup.forward(indices.contiguous(), weight_bf16.contiguous(), scores.contiguous(), vocab_size, per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        indices, weight, scores = ctx.saved_tensors
+        indices, weight_bf16, main_grad, scores = ctx.saved_tensors
         import fused_lookup
-        if weight.dtype == torch.float32:
-            new_weight = weight.param_bf16
-        else:
-            new_weight = weight
-        if hasattr(weight, "main_grad"):
-            score_grad = fused_lookup.backward(indices.contiguous(), new_weight.contiguous(), scores.contiguous(), grad_output.contiguous(), weight.main_grad, ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size, ctx.padding_idx, ctx.has_padding_idx)
-            weight_grad = None
-        else:
-            weight_grad = torch.zeros_like(weight, dtype=torch.float32)
-            score_grad = fused_lookup.backward(indices.contiguous(), new_weight.contiguous(), scores.contiguous(), grad_output.contiguous(), weight_grad, ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size, ctx.padding_idx, ctx.has_padding_idx)
-        return None, weight_grad, score_grad, None,None,None, None, None, None
+        # main_grad storage is shared with the original Parameter's main_grad buffer;
+        # the C++ kernel accumulates into it in-place.
+        score_grad = fused_lookup.backward(indices.contiguous(), weight_bf16.contiguous(), scores.contiguous(), grad_output.contiguous(), main_grad, ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size, ctx.padding_idx, ctx.has_padding_idx)
+        # inputs: indices, weight_bf16, main_grad, scores, padding_idx, vocab_size,
+        #         per_layer_vocab_size, shift, group_size, has_padding_idx
+        return None, None, None, score_grad, None, None, None, None, None, None
 
 
 class XperfGlu(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, indices, weight, p_input, vocab_size, per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx):
+    def forward(ctx, indices, weight_bf16, main_grad, p_input, vocab_size, per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx):
+        # weight_bf16: bf16 view of the value table (cast at call site; same tensor if already bf16)
+        # main_grad:   fp32 gradient accumulation buffer owned by the optimizer
         ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size = vocab_size, per_layer_vocab_size, shift, group_size
-        ctx.save_for_backward(indices, weight, p_input)
+        ctx.save_for_backward(indices, weight_bf16, main_grad, p_input)
         import fused_glu
-        if weight.dtype == torch.float32:
-            new_weight = weight.param_bf16
-        else:
-            new_weight = weight
-        output = fused_glu.forward(indices, new_weight, p_input, vocab_size, per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx)
+        output = fused_glu.forward(indices, weight_bf16, p_input, vocab_size, per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx)
         ctx.padding_idx = padding_idx
         ctx.has_padding_idx = has_padding_idx
         return output
@@ -353,16 +344,11 @@ class XperfGlu(torch.autograd.Function):
     @staticmethod
     def backward(ctx, output_grad):
         import fused_glu
-        indices, weight, p_input = ctx.saved_tensors
-        if weight.dtype == torch.float32:
-            new_weight = weight.param_bf16
-        else:
-            new_weight = weight
-        if hasattr(weight, "main_grad"):
-            p_input_grad = fused_glu.backward(indices, new_weight, p_input, output_grad.contiguous(), weight.main_grad, ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size, ctx.padding_idx, ctx.has_padding_idx)
-            weight_grad = None
-        else:
-            weight_grad = torch.zeros_like(weight, dtype=torch.float32)
-            p_input_grad = fused_glu.backward(indices, new_weight, p_input, output_grad.contiguous(), weight_grad, ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size, ctx.padding_idx, ctx.has_padding_idx)
-        return None, weight_grad, p_input_grad, None, None, None, None, None, None
+        indices, weight_bf16, main_grad, p_input = ctx.saved_tensors
+        # main_grad storage is shared with the original Parameter's main_grad buffer;
+        # the C++ kernel accumulates into it in-place.
+        p_input_grad = fused_glu.backward(indices, weight_bf16, p_input, output_grad.contiguous(), main_grad, ctx.vocab_size, ctx.per_layer_vocab_size, ctx.shift, ctx.group_size, ctx.padding_idx, ctx.has_padding_idx)
+        # inputs: indices, weight_bf16, main_grad, p_input, vocab_size,
+        #         per_layer_vocab_size, shift, group_size, padding_idx, has_padding_idx
+        return None, None, None, p_input_grad, None, None, None, None, None, None
 
